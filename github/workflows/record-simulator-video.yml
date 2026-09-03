@@ -1,0 +1,118 @@
+name: Record Expo iOS simulator video
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ record-sim-video ]
+
+jobs:
+  record-simulator:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout (target repo with workflow)
+        uses: actions/checkout@v4
+
+      - name: Clone source repo (rork-clean-eats)
+        run: |
+          git clone --depth=1 https://github.com/leavy36/rork-clean-eats.git source
+
+      - name: Show node / npm versions
+        run: |
+          node -v || true
+          npm -v || true
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
+
+      - name: Install dependencies (expo)
+        working-directory: source/expo
+        run: |
+          if [ -f yarn.lock ]; then
+            yarn install --frozen-lockfile
+          elif [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
+
+      - name: Build iOS (prebuild + pods)
+        working-directory: source/expo
+        run: |
+          set -euxo pipefail
+          # Ensure expo cli available
+          npm install -g expo-cli || true
+          # Prebuild iOS native project
+          if [ -f app.json ] || [ -f app.config.js ]; then
+            npx expo prebuild --platform ios --no-install || true
+          fi
+          # run pod install if ios/Podfile exists
+          if [ -d ios ]; then
+            (cd ios && pod install || true)
+          fi
+
+      - name: Start simulator & run app + record
+        env:
+          DEST: "platform=iOS Simulator,name=iPhone 14,OS=17.0"
+        run: |
+          set -euxo pipefail
+          OUTPUT_DIR=$PWD/output
+          mkdir -p "$OUTPUT_DIR"
+
+          # Build the app for simulator
+          if [ -d source/expo/ios ]; then
+            IOS_PROJECT_DIR=source/expo/ios
+          else
+            IOS_PROJECT_DIR=source/expo
+          fi
+
+          pushd "$IOS_PROJECT_DIR"
+          if ls *.xcworkspace 1> /dev/null 2>&1; then
+            WORKSPACE=$(ls *.xcworkspace | head -n1)
+            echo "Found workspace: $WORKSPACE"
+            xcodebuild -workspace "$WORKSPACE" -scheme "rork-clean-eats" -sdk iphonesimulator -destination "$DEST" clean build -allowProvisioningUpdates | tee xcodebuild.log || true
+          elif ls *.xcodeproj 1> /dev/null 2>&1; then
+            PROJ=$(ls *.xcodeproj | head -n1)
+            echo "Found project: $PROJ"
+            SCHEME=$(xcodebuild -list -project "$PROJ" 2>/dev/null | sed -n '/Schemes:/,$p' | tail -n +2 | head -n1 | tr -d '[:space:]' || true)
+            echo "Detected scheme: $SCHEME"
+            if [ -n "$SCHEME" ]; then
+              xcodebuild -project "$PROJ" -scheme "$SCHEME" -sdk iphonesimulator -destination "$DEST" clean build -allowProvisioningUpdates | tee xcodebuild.log || true
+            fi
+          else
+            echo "No Xcode workspace/project found; attempting to start Expo app in simulator"
+          fi
+          popd
+
+          # Start recording and run the app via expo if build failed
+          xcrun simctl list devices | grep Booted || true
+          RECORD_PATH="$OUTPUT_DIR/simulator.mp4"
+          xcrun simctl io booted recordVideo "$RECORD_PATH" &
+          RECORD_PID=$!
+
+          if [ -d source/expo ]; then
+            echo "Attempting to start expo in background and open the app"
+            pushd source/expo
+            npx expo start --tunnel --no-dev --minify &
+            EXPO_PID=$!
+            sleep 8
+            npx expo run:ios --device "Simulator" || true
+            sleep 20
+            kill $EXPO_PID || true
+            popd
+          fi
+
+          sleep 5
+
+          kill "$RECORD_PID" || true
+          wait "$RECORD_PID" 2>/dev/null || true
+
+          ls -lh "$RECORD_PATH" || true
+
+      - name: Upload simulator video
+        uses: actions/upload-artifact@v4
+        with:
+          name: simulator-video
+          path: output/simulator.mp4
